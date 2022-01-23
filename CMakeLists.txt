@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 
 add_subdirectory(backward-cpp)
 
-add_executable(HikBridge main.cpp ${BACKWARD_ENABLE} HikDeviceSession.cpp HikDeviceSession.h)
+add_executable(HikBridge main.cpp ${BACKWARD_ENABLE} StateMachine.cpp StateMachine.h)
 if (DEFINED REMOTE)
     message("** Building remotely")
     target_link_libraries(HikBridge PUBLIC bfd)
@@ -23,5 +23,7 @@ include_directories(plog/include)
 include_directories(cxxopts/include)
 include_directories(hik-sdk-include)
 include_directories(backward-cpp)
+
+configure_file("DiveMulaw.wav" "DiveMulaw.wav" COPYONLY)
 
 add_definitions(-include plog/Log.h)

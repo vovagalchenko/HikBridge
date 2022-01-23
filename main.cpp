@@ -9,8 +9,15 @@
 #include <functional>
 #include <backward.hpp>
 #include <utility>
-#include "HikDeviceSession.h"
+#include <HCNetSDK.h>
+#include <thread>
 
+
+typedef int HikSessionId, HikEventListeningHandle, HikVoiceComHandle;
+
+std::string ringtoneAudioFilePath;
+HikSessionId sessionId;
+HikVoiceComHandle voiceComHandle = -1;
 
 void shutdown(std::optional<std::string> errorMessage = std::nullopt) {
     if (auto msg = std::move(errorMessage)) {
@@ -26,6 +33,92 @@ void shutdown(std::optional<std::string> errorMessage = std::nullopt) {
         PLOG_INFO << "HikBridge shutting down.";
         exit(0);
     }
+}
+
+std::string obtainHikSDKErrorMsg(const std::string& prefix = "HikSDK Error") {
+    int errorCode = 0;
+    char *errMsg = NET_DVR_GetErrorMsg(&errorCode);
+    std::stringstream ss;
+    ss << prefix << " | <" << errorCode << "> " << errMsg;
+    return ss.str();
+}
+
+HikSessionId logInToDevice(
+    const std::string& host,
+    unsigned short port,
+    const std::string& username,
+    const std::string& password
+) {
+    PLOG_INFO << "Creating a session to a Hikvision device at "
+              << username << ":" << password << "@" << host << ":" << port;
+    bool initSuccessful = NET_DVR_Init();
+    if (!initSuccessful) {
+        shutdown("Failed to initialize Hik SDK.");
+    }
+
+    NET_DVR_SetConnectTime(2000, 1);
+    NET_DVR_SetReconnect(10000, true);
+
+    NET_DVR_USER_LOGIN_INFO loginInfo;
+    loginInfo.bUseAsynLogin = 0;
+    loginInfo.wPort = 8000;
+    strcpy(loginInfo.sDeviceAddress, host.c_str());
+    strcpy(loginInfo.sUserName, username.c_str());
+    strcpy(loginInfo.sPassword, password.c_str());
+
+    NET_DVR_DEVICEINFO_V40 deviceInfoV40 = {0};
+    int sid = NET_DVR_Login_V40(&loginInfo, &deviceInfoV40);
+
+    if (sid < 0) {
+        shutdown(obtainHikSDKErrorMsg("Failed to log in to Hik device."));
+    }
+    PLOG_INFO << "Successfully logged in with session id <" << sid << ">";
+    return sid;
+}
+
+
+void hikEventsCallback(LONG lCommand, NET_DVR_ALARMER *pAlarmer, char *pAlarmInfo, DWORD dwBufLen, void* pUser) {
+    if (lCommand == COMM_ALARM_VIDEO_INTERCOM) {
+        auto *videoIntercomAlarm = reinterpret_cast<NET_DVR_VIDEO_INTERCOM_ALARM *>(pAlarmInfo);
+        PLOG_INFO << "Received Hik video intercom alarm: <" << (int) videoIntercomAlarm->byAlarmType << ">";
+        if (videoIntercomAlarm->byAlarmType == 0x11) {
+            // The bell button was pressed
+        }
+    } else {
+        PLOG_INFO << "Received Hik device event <" << lCommand << ">.";
+    }
+}
+
+HikEventListeningHandle registerForHikEvents() {
+    PLOG_INFO << "Registering for Hikvision events on session id <" << sessionId << ">";
+
+    NET_DVR_SETUPALARM_PARAM setupParam;
+    setupParam.dwSize = sizeof(NET_DVR_SETUPALARM_PARAM);
+    setupParam.byAlarmInfoType = 1; // Real-time alarm
+    setupParam.byLevel = 2; // Priority
+
+    HikEventListeningHandle handle = NET_DVR_SetupAlarmChan_V41(sessionId, &setupParam);
+    if (handle < 0) {
+        shutdown(obtainHikSDKErrorMsg("Failed to register for events for Hik device."));
+    }
+    PLOG_INFO << "Successfully registered for receiving Hik device events with handle <" << handle << ">";
+    return handle;
+}
+
+HikVoiceComHandle startVoiceCommunications() {
+    PLOG_INFO << "Starting voice communications on session id <" << sessionId << ">";
+
+    voiceComHandle = NET_DVR_StartVoiceCom_MR_V30(
+        sessionId,
+        1,
+        /*hikVoiceCommunicationsCallback*/NULL,
+        nullptr
+    );
+    if (voiceComHandle < 0) {
+        shutdown(obtainHikSDKErrorMsg("Failed to establish voice comms."));
+    }
+    PLOG_INFO << "Successfully started voice communications with handle <" << voiceComHandle << ">";
+    return voiceComHandle;
 }
 
 int main(int argc, char** argv) {
@@ -63,6 +156,11 @@ int main(int argc, char** argv) {
             cxxopts::value<std::string>()
         )
         (
+            "t,ringtone-audio",
+            "Path to file to use as ringtone audio",
+                cxxopts::value<std::string>()->default_value("")
+        )
+        (
             "s,soundcard-coordinates",
             "The ALSA name of the soundcard to read mu-law sound signal from",
             cxxopts::value<std::string>()
@@ -77,63 +175,46 @@ int main(int argc, char** argv) {
         deviceUsername = result["device-username"].as<std::string>();
         devicePassword = result["device-password"].as<std::string>();
         soundcardCoordinates = result["soundcard-coordinates"].as<std::string>();
+        ringtoneAudioFilePath = result["ringtone-audio"].as<std::string>();
+
     } catch (const cxxopts::option_has_no_value_exception& e) {
         shutdown(std::make_optional(e.what()));
     }
 
+    sessionId = logInToDevice(
+        deviceHost,
+        devicePort,
+        deviceUsername,
+        devicePassword
+    );
 
-
-
-    try {
-        HikDeviceSession deviceSession = HikDeviceSession(
-            deviceHost,
-            devicePort,
-            deviceUsername,
-            devicePassword
-        );
-        deviceSession.subscribeToEvents([](HikDeviceSessionEvent e) {
-            PLOG_INFO << "Received event: " << e;
-        });
-
-    } catch (const HikDeviceSessionException& e) {
-        shutdown(std::make_optional(e.what()));
+    NET_DVR_COMPRESSION_AUDIO audioSettings = { 0 };
+    audioSettings.byAudioEncType = 1;
+    audioSettings.byAudioSamplingRate = 5;
+    audioSettings.byAudioBitRate = BITRATE_ENCODE_128kps;
+    audioSettings.bySupport = 0;
+    if (!NET_DVR_SetDVRConfig(
+        sessionId,
+        NET_DVR_SET_COMPRESSCFG_AUD,
+        1,
+        &audioSettings,
+        sizeof(audioSettings)
+    )) {
+        shutdown(obtainHikSDKErrorMsg("Failed to set audio settings"));
+    } else {
+        PLOG_INFO << "Successfully set Hik device audio settings.";
     }
+
+    NET_DVR_SetDVRMessageCallBack_V50(0, &hikEventsCallback, nullptr);
+
+    HikEventListeningHandle eventLHandle = registerForHikEvents();
+
+    sleep(20);
 
     shutdown();
 }
 
-long logInToDevice(std::string host, unsigned short port, std::string username, std::string password) {
-    PLOG_INFO << "Creating a session to a Hikvision device at "
-              << username << ":" << password << "@" << host << ":" << port;
-    bool initSuccessful = NET_DVR_Init();
-    if (!initSuccessful) {
-        throw HikDeviceSessionException("Failed to initialize.");
-    }
 
-    NET_DVR_SetConnectTime(2000, 1);
-    NET_DVR_SetReconnect(10000, true);
-
-    NET_DVR_USER_LOGIN_INFO loginInfo;
-    loginInfo.bUseAsynLogin = 0;
-    loginInfo.wPort = 8000;
-    strcpy(loginInfo.sDeviceAddress, host.c_str());
-    strcpy(loginInfo.sUserName, username.c_str());
-    strcpy(loginInfo.sPassword, password.c_str());
-
-    NET_DVR_DEVICEINFO_V40 deviceInfoV40 = {0};
-    int sid = NET_DVR_Login_V40(&loginInfo, &deviceInfoV40);
-
-    if (sid < 0) {
-        int errorCode = 0;
-        char *errMsg = NET_DVR_GetErrorMsg(&errorCode);
-        std::stringstream ss;
-        ss << "Failed to log in due to error <" << errorCode << "> - " << errMsg;
-        throw HikDeviceSessionException(ss.str());
-    } else {
-        PLOG_INFO << "Successfully logged in with session id <" << sid << ">";
-        return
-    }
-}
 
 
 
