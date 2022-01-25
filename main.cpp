@@ -126,15 +126,13 @@ void hikVoiceCommunicationsCallback(
     HikVoiceComHandle lVoiceComHandle, char *pRecvDataBuffer, DWORD dwBufSize, BYTE byAudioFlag, void* pUser
 ) {
     assert(dwBufSize == sizeof(soundcardReadBuffer));
-    PLOG_ERROR << "CALLED";
     std::unique_lock<std::mutex> soundcardReadBufferLock(soundcardReadBufferMutex);
     soundcardReadBufferCV.wait(soundcardReadBufferLock);
-    PLOG_ERROR << "DONE WAITING";
     memcpy(pRecvDataBuffer, soundcardReadBuffer, dwBufSize);
     soundcardReadBufferLock.unlock();
 
     if (NET_DVR_VoiceComSendData(lVoiceComHandle, pRecvDataBuffer, dwBufSize)) {
-        PLOG_INFO << "Successfully sent " << dwBufSize << " bytes of audio to the Hik device.";
+        PLOG_DEBUG << "Successfully sent " << dwBufSize << " bytes of audio to the Hik device.";
     } else {
         PLOG_WARNING << obtainHikSDKErrorMsg("Failed sending audio to the Hik device.");
     }
@@ -163,6 +161,8 @@ void stopVoiceCommunications(HikVoiceComHandle voiceComHandle) {
 
     if (!NET_DVR_StopVoiceCom(voiceComHandle)) {
         shutdown(obtainHikSDKErrorMsg("Failed to tear down voice comms."));
+    } else {
+        PLOG_INFO << "Successfully wrapped up voice communications on session id <" << sessionId << ">";
     }
 }
 
@@ -320,6 +320,7 @@ void alsaErrorLogger(const char *file, int line, const char *function, int err, 
                 PLOG_INFO << "Observed " << MILLIS_OF_SILENCE_BEFORE_HANGUP << " millis of silence. Hanging up.";
                 stopVoiceCommunications(voiceComHandle);
                 voiceComHandle = -1;
+                startOfSilence = -1;
             }
         }
     }
@@ -330,7 +331,7 @@ int main(int argc, char** argv) {
 
     static plog::ColorConsoleAppender<plog::TxtFormatter> consoleAppender;
     plog::init(
-        plog::verbose,
+        plog::info,
         "var/log/hikbridge/",
         10u * (1u << 30u), // 10MB
         100
