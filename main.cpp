@@ -6,31 +6,46 @@
 #include <plog/Appenders/ColorConsoleAppender.h>
 #include <cxxopts.hpp>
 #include <optional>
-#include <functional>
 #include <backward.hpp>
 #include <utility>
 #include <HCNetSDK.h>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#ifdef REMOTE
+    #include <alsa/asoundlib.h>
+#else
+    #include "alsa-lib-1.2.6.1/include/asoundlib.h"
+#endif
 
 
+#define MILLIS_OF_SILENCE_BEFORE_HANGUP 5000
 typedef int HikSessionId, HikEventListeningHandle, HikVoiceComHandle;
 
 std::string ringtoneAudioFilePath;
 HikSessionId sessionId;
-HikVoiceComHandle voiceComHandle = -1;
+char soundcardReadBuffer[160];
+std::mutex soundcardReadBufferMutex;
+std::condition_variable soundcardReadBufferCV;
+
+void shutdown(std::stringstream &stream) {
+    backward::StackTrace st;
+    st.load_here();
+    backward::Printer p;
+    p.snippet = true;
+    std::ostringstream btStream;
+    p.print(st, btStream);
+    PLOG_FATAL << "HikBridge shutting down due to error: " << std::endl << stream.str() << std::endl << btStream.str();
+    exit(1);
+}
 
 void shutdown(std::optional<std::string> errorMessage = std::nullopt) {
     if (auto msg = std::move(errorMessage)) {
-        backward::StackTrace st;
-        st.load_here();
-        backward::Printer p;
-        p.snippet = true;
-        std::ostringstream btStream;
-        p.print(st, btStream);
-        PLOG_FATAL << "HikBridge shutting down due to error: " << std::endl << *msg << std::endl << btStream.str();
-        exit(1);
+        std::stringstream ss;
+        ss << *msg;
+        shutdown(ss);
     } else {
-        PLOG_INFO << "HikBridge shutting down.";
+        PLOG_INFO << "HikBridge shutting down gracefully.";
         exit(0);
     }
 }
@@ -92,6 +107,8 @@ void hikEventsCallback(LONG lCommand, NET_DVR_ALARMER *pAlarmer, char *pAlarmInf
 HikEventListeningHandle registerForHikEvents() {
     PLOG_INFO << "Registering for Hikvision events on session id <" << sessionId << ">";
 
+    NET_DVR_SetDVRMessageCallBack_V50(0, &hikEventsCallback, nullptr);
+
     NET_DVR_SETUPALARM_PARAM setupParam;
     setupParam.dwSize = sizeof(NET_DVR_SETUPALARM_PARAM);
     setupParam.byAlarmInfoType = 1; // Real-time alarm
@@ -105,13 +122,31 @@ HikEventListeningHandle registerForHikEvents() {
     return handle;
 }
 
+void hikVoiceCommunicationsCallback(
+    HikVoiceComHandle lVoiceComHandle, char *pRecvDataBuffer, DWORD dwBufSize, BYTE byAudioFlag, void* pUser
+) {
+    assert(dwBufSize == sizeof(soundcardReadBuffer));
+    PLOG_ERROR << "CALLED";
+    std::unique_lock<std::mutex> soundcardReadBufferLock(soundcardReadBufferMutex);
+    soundcardReadBufferCV.wait(soundcardReadBufferLock);
+    PLOG_ERROR << "DONE WAITING";
+    memcpy(pRecvDataBuffer, soundcardReadBuffer, dwBufSize);
+    soundcardReadBufferLock.unlock();
+
+    if (NET_DVR_VoiceComSendData(lVoiceComHandle, pRecvDataBuffer, dwBufSize)) {
+        PLOG_INFO << "Successfully sent " << dwBufSize << " bytes of audio to the Hik device.";
+    } else {
+        PLOG_WARNING << obtainHikSDKErrorMsg("Failed sending audio to the Hik device.");
+    }
+}
+
 HikVoiceComHandle startVoiceCommunications() {
     PLOG_INFO << "Starting voice communications on session id <" << sessionId << ">";
 
-    voiceComHandle = NET_DVR_StartVoiceCom_MR_V30(
+    HikVoiceComHandle voiceComHandle = NET_DVR_StartVoiceCom_MR_V30(
         sessionId,
         1,
-        /*hikVoiceCommunicationsCallback*/NULL,
+        hikVoiceCommunicationsCallback,
         nullptr
     );
     if (voiceComHandle < 0) {
@@ -119,6 +154,176 @@ HikVoiceComHandle startVoiceCommunications() {
     }
     PLOG_INFO << "Successfully started voice communications with handle <" << voiceComHandle << ">";
     return voiceComHandle;
+}
+
+
+
+void stopVoiceCommunications(HikVoiceComHandle voiceComHandle) {
+    PLOG_INFO << "Wrapping up voice communications on session id <" << sessionId << ">";
+
+    if (!NET_DVR_StopVoiceCom(voiceComHandle)) {
+        shutdown(obtainHikSDKErrorMsg("Failed to tear down voice comms."));
+    }
+}
+
+void alsaErrorLogger(const char *file, int line, const char *function, int err, const char *fmt, ...) {
+    va_list args;
+    va_start (args, fmt);
+    std::stringstream fmtStream;
+    fmtStream << "Error logged from ALSA internals @ <" << file << ">:" << line << ": " << fmt;
+#define BUFF_SIZE ((1 << 10) * 5)
+    char buff[BUFF_SIZE];
+    vsnprintf(buff, BUFF_SIZE, fmt, args);
+    va_end(args);
+    PLOG_ERROR << buff;
+}
+
+[[noreturn]] void soundcardReadLoop(const std::string &soundcardCoordinates) {
+    PLOG_INFO << "Starting reading from soundcard @ " << soundcardCoordinates;
+
+    auto checkAlsaError = [](int errCode) -> std::optional<std::string> {
+        if (errCode < 0) {
+            std::stringstream alsaErrStream;
+            alsaErrStream << "ALSA ERROR CODE | <" << errCode << "> – " << snd_strerror(errCode);
+            return alsaErrStream.str();
+        }
+        return std::nullopt;
+    };
+
+    snd_lib_error_set_handler(alsaErrorLogger);
+
+    snd_pcm_t *captureHandle;
+    if (
+        auto sndOpenErrorMsg = checkAlsaError(
+            snd_pcm_open(
+                &captureHandle,
+                soundcardCoordinates.c_str(),
+                SND_PCM_STREAM_CAPTURE,
+                0
+            )
+        )
+    ) {
+        shutdown(*sndOpenErrorMsg);
+    } else {
+        PLOG_INFO << "Successfully opened an ALSA capture handle.";
+    }
+
+    snd_pcm_format_t format = SND_PCM_FORMAT_MU_LAW;
+    unsigned short numChannels = 1;
+    unsigned int sampleRate = 8000;
+    int allowResampling = 1;
+    unsigned int requiredLatencyInUs = 500000;
+    if (
+        auto pcmSetParamsErrorMsg = checkAlsaError(
+            snd_pcm_set_params(
+                captureHandle,
+                format,
+                SND_PCM_ACCESS_RW_INTERLEAVED,
+                numChannels,
+                sampleRate,
+                allowResampling,
+                requiredLatencyInUs
+            )
+        )
+    ) {
+        shutdown(*pcmSetParamsErrorMsg);
+    } else {
+        PLOG_INFO << "Successfully set PCM params for capture handle";
+    }
+
+    unsigned int bitsPerSample = snd_pcm_format_width(format);
+    unsigned short bitsPerByte = 8;
+    HikVoiceComHandle voiceComHandle = -1;
+    auto currTimeInMillis = []() {
+        struct timeval tv {};
+        gettimeofday(&tv, nullptr);
+        return (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
+    };
+    long startOfSilence = -1;
+    unsigned long numFramesToRead = sizeof(soundcardReadBuffer) / (numChannels * (bitsPerSample / bitsPerByte));
+
+    auto readFromPcm = [captureHandle, numFramesToRead]() {
+        std::lock_guard<std::mutex> lk(soundcardReadBufferMutex);
+        return snd_pcm_readi(captureHandle, soundcardReadBuffer, numFramesToRead);
+    };
+
+    PLOG_INFO << "Capturing sound from the soundcard";
+    while (true) {
+        long errCode;
+        PLOG_DEBUG << "About to read " << numFramesToRead << " frames from the soundcard";
+
+        if (
+            (
+                errCode = readFromPcm()
+            ) != numFramesToRead
+        ) {
+            auto errMsg = checkAlsaError((int) errCode);
+            PLOG_WARNING << "Failed reading audio from soundcard: " << *errMsg;
+            if (errCode == -EPIPE) {
+                PLOG_WARNING << "Experiencing overrun.";
+                snd_pcm_status_t *status;
+                snd_pcm_status_alloca(&status);
+                if (auto pcmStatusErrMsg = checkAlsaError(snd_pcm_status(captureHandle, status))) {
+                    std::stringstream ss;
+                    ss << "Failed to get PCM status after overrun: " << *pcmStatusErrMsg;
+                    shutdown(ss);
+                }
+                snd_pcm_status_get_state(status);
+                snd_output_t *statusOutput;
+                snd_output_buffer_open(&statusOutput);
+                snd_pcm_status_dump(status, statusOutput);
+                char *buff;
+                snd_output_buffer_string(statusOutput, &buff);
+                PLOG_WARNING << "PCM status: " << std::endl << buff;
+                snd_output_close(statusOutput);
+
+                if (auto recoverErrorMsg = checkAlsaError(
+                    snd_pcm_recover(captureHandle, (int) errCode, 0)
+                )) {
+                    std::stringstream ss;
+                    ss << "Failed to recover after overrun: " << *recoverErrorMsg;
+                    shutdown(ss);
+                } else {
+                    PLOG_WARNING << "Recovered seemingly successfully.";
+                }
+            } else {
+                shutdown(errMsg);
+            }
+        } else {
+            soundcardReadBufferCV.notify_all();
+            // Yield in case the hik device communications thread wants to proceed
+            std::this_thread::yield();
+
+            bool isSilence = true;
+            for (char c : soundcardReadBuffer) {
+                if (c != (char) 0xFF) {
+                    isSilence = false;
+                    break;
+                }
+            }
+
+            if (voiceComHandle < 0 && !isSilence) {
+                PLOG_INFO << "Detected audio! Going to start relying audio to Hik device.";
+                voiceComHandle = startVoiceCommunications();
+            } else if (voiceComHandle >= 0 && startOfSilence < 0 && isSilence) {
+                PLOG_INFO << "Detected start of silence. If no sound is heard for "
+                    << MILLIS_OF_SILENCE_BEFORE_HANGUP << " millis we will hang up voice communications.";
+                startOfSilence = currTimeInMillis();
+            } else if (voiceComHandle >= 0 && startOfSilence >= 0 && !isSilence) {
+                PLOG_INFO << "Heard sound. Postponing hang up.";
+                startOfSilence = -1;
+            } else if (
+                voiceComHandle >= 0 &&
+                currTimeInMillis() - startOfSilence > MILLIS_OF_SILENCE_BEFORE_HANGUP &&
+                isSilence
+            ) {
+                PLOG_INFO << "Observed " << MILLIS_OF_SILENCE_BEFORE_HANGUP << " millis of silence. Hanging up.";
+                stopVoiceCommunications(voiceComHandle);
+                voiceComHandle = -1;
+            }
+        }
+    }
+
 }
 
 int main(int argc, char** argv) {
@@ -188,6 +393,8 @@ int main(int argc, char** argv) {
         devicePassword
     );
 
+    HikEventListeningHandle eventLHandle = registerForHikEvents();
+
     NET_DVR_COMPRESSION_AUDIO audioSettings = { 0 };
     audioSettings.byAudioEncType = 1;
     audioSettings.byAudioSamplingRate = 5;
@@ -205,11 +412,9 @@ int main(int argc, char** argv) {
         PLOG_INFO << "Successfully set Hik device audio settings.";
     }
 
-    NET_DVR_SetDVRMessageCallBack_V50(0, &hikEventsCallback, nullptr);
+    std::thread soundcardReadThread(soundcardReadLoop, soundcardCoordinates);
 
-    HikEventListeningHandle eventLHandle = registerForHikEvents();
-
-    sleep(20);
+    soundcardReadThread.join();
 
     shutdown();
 }
