@@ -23,6 +23,7 @@
 typedef int HikSessionId, HikEventListeningHandle, HikVoiceComHandle;
 
 std::string ringtoneAudioFilePath;
+std::string ringtonePlaybackDeviceCoordinates;
 HikSessionId sessionId;
 char soundcardReadBuffer[160];
 std::mutex soundcardReadBufferMutex;
@@ -91,17 +92,152 @@ HikSessionId logInToDevice(
     return sid;
 }
 
+std::optional<std::string> checkAlsaError(int errCode) {
+    if (errCode < 0) {
+        std::stringstream alsaErrStream;
+        alsaErrStream << "ALSA ERROR CODE | <" << errCode << "> – " << snd_strerror(errCode);
+        return alsaErrStream.str();
+    }
+    return std::nullopt;
+}
 
+void recoverPcm(snd_pcm_t *handle, int errCode) {
+    if (errCode == -EPIPE) {
+        PLOG_WARNING << "Experiencing xrun.";
+        snd_pcm_status_t *status;
+        snd_pcm_status_alloca(&status);
+        if (auto pcmStatusErrMsg = checkAlsaError(snd_pcm_status(handle, status))) {
+            std::stringstream ss;
+            ss << "Failed to get PCM status after xrun: " << *pcmStatusErrMsg;
+            shutdown(ss);
+        }
+        snd_pcm_status_get_state(status);
+        snd_output_t *statusOutput;
+        snd_output_buffer_open(&statusOutput);
+        snd_pcm_status_dump(status, statusOutput);
+        char *buff;
+        snd_output_buffer_string(statusOutput, &buff);
+        PLOG_WARNING << "PCM status: " << std::endl << buff;
+        snd_output_close(statusOutput);
+
+        if (auto recoverErrorMsg = checkAlsaError(
+            snd_pcm_recover(handle, (int) errCode, 0)
+        )) {
+            std::stringstream ss;
+            ss << "Failed to recover after xrun: " << *recoverErrorMsg;
+            shutdown(ss);
+        } else {
+            PLOG_WARNING << "Recovered seemingly successfully.";
+        }
+    } else if (auto errMsg = checkAlsaError(errCode)){
+        // TODO: probably shouldn't kill the entire process in case of underrun during playback
+        shutdown(*errMsg);
+    }
+}
+
+void ringtonePlaybackLoop() {
+
+    snd_pcm_t *playbackHandle;
+    if (
+        auto sndOpenErrorMsg = checkAlsaError(
+            snd_pcm_open(
+                &playbackHandle,
+                ringtonePlaybackDeviceCoordinates.c_str(),
+                SND_PCM_STREAM_PLAYBACK,
+                0
+            )
+        )
+        ) {
+        shutdown(*sndOpenErrorMsg);
+    } else {
+        PLOG_INFO << "Successfully opened an ALSA playback handle for " << ringtonePlaybackDeviceCoordinates;
+    }
+
+    // TODO: This is the same as in the soundcard capture loop
+    snd_pcm_format_t format = SND_PCM_FORMAT_MU_LAW;
+    unsigned short numChannels = 1;
+    unsigned int sampleRate = 8000;
+    int allowResampling = 1;
+    unsigned int requiredLatencyInUs = 500000;
+    if (
+        auto pcmSetParamsErrorMsg = checkAlsaError(
+            snd_pcm_set_params(
+                playbackHandle,
+                format,
+                SND_PCM_ACCESS_RW_INTERLEAVED,
+                numChannels,
+                sampleRate,
+                allowResampling,
+                requiredLatencyInUs
+            )
+        )
+        ) {
+        shutdown(*pcmSetParamsErrorMsg);
+    } else {
+        PLOG_INFO << "Successfully set PCM params for capture handle";
+    }
+
+    PLOG_INFO << "Opening ringtone file @ " << ringtoneAudioFilePath;
+    std::ifstream ringtoneFile(ringtoneAudioFilePath, std::ifstream::binary);
+    if (!ringtoneFile.good()) {
+        PLOG_ERROR << "Failed to open the ringtone file: " << strerror(errno);
+        return;
+    }
+
+#define BUFF_SIZE 160
+    char buff[BUFF_SIZE];
+    unsigned int bitsPerSample = snd_pcm_format_width(format);
+    unsigned short bitsPerByte = 8;
+    unsigned long numFramesToWrite = sizeof(soundcardReadBuffer) / (numChannels * (bitsPerSample / bitsPerByte));
+    long errCode;
+    while (ringtoneFile.readsome(buff, BUFF_SIZE)) {
+        if ((errCode = snd_pcm_writei(playbackHandle, buff, numFramesToWrite)) != numFramesToWrite) {
+            auto errMsg = checkAlsaError((int) errCode);
+            PLOG_WARNING << "Failed writing audio to soundcard: " << *errMsg;
+            recoverPcm(playbackHandle, (int) errCode);
+        }
+    }
+}
+
+bool ringtonePlaying = false;
+std::mutex ringtonePlaybackMutex;
+struct Finally {
+private:
+    void (*destructionFunc)();
+public:
+    explicit Finally(void (*func)()): destructionFunc(func) {}
+    ~Finally() { destructionFunc(); }
+};
 void hikEventsCallback(LONG lCommand, NET_DVR_ALARMER *pAlarmer, char *pAlarmInfo, DWORD dwBufLen, void* pUser) {
     if (lCommand == COMM_ALARM_VIDEO_INTERCOM) {
         auto *videoIntercomAlarm = reinterpret_cast<NET_DVR_VIDEO_INTERCOM_ALARM *>(pAlarmInfo);
         PLOG_INFO << "Received Hik video intercom alarm: <" << (int) videoIntercomAlarm->byAlarmType << ">";
         if (videoIntercomAlarm->byAlarmType == 0x11) {
-            // The bell button was pressed
+            PLOG_INFO << "Bell button was pressed";
+
+            {
+                const std::lock_guard<std::mutex> guard(ringtonePlaybackMutex);
+                if (ringtonePlaying) {
+                    PLOG_INFO << "Ringtone is already playing";
+                } else {
+                    PLOG_INFO << "Kicking off ringtone playback";
+                    ringtonePlaying = true;
+                    std::thread ringtonePlaybackThread([] {
+                        Finally f([] {
+                            const std::lock_guard<std::mutex> g(ringtonePlaybackMutex);
+                            ringtonePlaying = false;
+                            PLOG_INFO << "Ringtone playback completed";
+                        });
+                        ringtonePlaybackLoop();
+                    });
+                    ringtonePlaybackThread.detach();
+                }
+            }
         }
     } else {
         PLOG_INFO << "Received Hik device event <" << lCommand << ">.";
     }
+    PLOG_INFO << "Finished processing Hik device event";
 }
 
 HikEventListeningHandle registerForHikEvents() {
@@ -122,14 +258,26 @@ HikEventListeningHandle registerForHikEvents() {
     return handle;
 }
 
+bool hikRelayEnabled = false;
 void hikVoiceCommunicationsCallback(
     HikVoiceComHandle lVoiceComHandle, char *pRecvDataBuffer, DWORD dwBufSize, BYTE byAudioFlag, void* pUser
 ) {
     assert(dwBufSize == sizeof(soundcardReadBuffer));
+    if (!hikRelayEnabled) {
+        PLOG_INFO << "Hik relay is disabled, so we're going to short circuit the mutex/CV dance.";
+        return;
+    }
     std::unique_lock<std::mutex> soundcardReadBufferLock(soundcardReadBufferMutex);
+    soundcardReadBufferCV.notify_one();
     soundcardReadBufferCV.wait(soundcardReadBufferLock);
     memcpy(pRecvDataBuffer, soundcardReadBuffer, dwBufSize);
     soundcardReadBufferLock.unlock();
+    soundcardReadBufferCV.notify_one();
+
+    if (!hikRelayEnabled) {
+        PLOG_INFO << "Hik relay is disabled, so we're going to short circuit the voice comm call.";
+        return;
+    }
 
     if (NET_DVR_VoiceComSendData(lVoiceComHandle, pRecvDataBuffer, dwBufSize)) {
         PLOG_DEBUG << "Successfully sent " << dwBufSize << " bytes of audio to the Hik device.";
@@ -138,7 +286,7 @@ void hikVoiceCommunicationsCallback(
     }
 }
 
-HikVoiceComHandle startVoiceCommunications() {
+HikVoiceComHandle startVoiceCommunications(unsigned short retryNum = 1) {
     PLOG_INFO << "Starting voice communications on session id <" << sessionId << ">";
 
     HikVoiceComHandle voiceComHandle = NET_DVR_StartVoiceCom_MR_V30(
@@ -148,9 +296,16 @@ HikVoiceComHandle startVoiceCommunications() {
         nullptr
     );
     if (voiceComHandle < 0) {
-        shutdown(obtainHikSDKErrorMsg("Failed to establish voice comms."));
+        PLOG_ERROR << obtainHikSDKErrorMsg("Failed to establish voice comms.");
+        if (retryNum < 3) {
+            PLOG_WARNING << "Retry num " << retryNum;
+            return startVoiceCommunications(retryNum + 1);
+        } else {
+            shutdown(obtainHikSDKErrorMsg("Failed to establish voice comms."));
+        }
+    } else {
+        PLOG_INFO << "Successfully started voice communications with handle <" << voiceComHandle << ">";
     }
-    PLOG_INFO << "Successfully started voice communications with handle <" << voiceComHandle << ">";
     return voiceComHandle;
 }
 
@@ -178,17 +333,9 @@ void alsaErrorLogger(const char *file, int line, const char *function, int err, 
     PLOG_ERROR << buff;
 }
 
+
 [[noreturn]] void soundcardReadLoop(const std::string &soundcardCoordinates) {
     PLOG_INFO << "Starting reading from soundcard @ " << soundcardCoordinates;
-
-    auto checkAlsaError = [](int errCode) -> std::optional<std::string> {
-        if (errCode < 0) {
-            std::stringstream alsaErrStream;
-            alsaErrStream << "ALSA ERROR CODE | <" << errCode << "> – " << snd_strerror(errCode);
-            return alsaErrStream.str();
-        }
-        return std::nullopt;
-    };
 
     snd_lib_error_set_handler(alsaErrorLogger);
 
@@ -234,23 +381,39 @@ void alsaErrorLogger(const char *file, int line, const char *function, int err, 
     unsigned int bitsPerSample = snd_pcm_format_width(format);
     unsigned short bitsPerByte = 8;
     HikVoiceComHandle voiceComHandle = -1;
-    auto currTimeInMillis = []() {
+    const auto currTimeInMillis = []() {
         struct timeval tv {};
         gettimeofday(&tv, nullptr);
         return (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
     };
+    const auto currTimeInSeconds = [currTimeInMillis]() {
+        return currTimeInMillis() / 1000;
+    };
     long startOfSilence = -1;
     unsigned long numFramesToRead = sizeof(soundcardReadBuffer) / (numChannels * (bitsPerSample / bitsPerByte));
 
-    auto readFromPcm = [captureHandle, numFramesToRead]() {
-        std::lock_guard<std::mutex> lk(soundcardReadBufferMutex);
+    bool isBufferReady = false;
+    auto readFromPcm = [captureHandle, numFramesToRead, &voiceComHandle, &isBufferReady]() {
+        std::unique_lock<std::mutex> lk(soundcardReadBufferMutex);
+        if (isBufferReady && voiceComHandle >= 0) {
+            soundcardReadBufferCV.notify_one();
+            soundcardReadBufferCV.wait(lk);
+        }
+        isBufferReady = false;
         return snd_pcm_readi(captureHandle, soundcardReadBuffer, numFramesToRead);
     };
 
     PLOG_INFO << "Capturing sound from the soundcard";
+    unsigned long loggingCounter = 1;
+    unsigned short loggingIntervalInSeconds = 60;
+    unsigned long startTimeInSeconds = currTimeInSeconds();
     while (true) {
         long errCode;
         PLOG_DEBUG << "About to read " << numFramesToRead << " frames from the soundcard";
+        if (currTimeInSeconds() >= startTimeInSeconds + (loggingCounter * loggingIntervalInSeconds)) {
+            loggingCounter++;
+            PLOG_INFO << "Still capturing sound from the soundcard.";
+        }
 
         if (
             (
@@ -290,10 +453,8 @@ void alsaErrorLogger(const char *file, int line, const char *function, int err, 
                 shutdown(errMsg);
             }
         } else {
-            soundcardReadBufferCV.notify_all();
-            // Yield in case the hik device communications thread wants to proceed
-            std::this_thread::yield();
-
+            isBufferReady = true;
+            soundcardReadBufferCV.notify_one();
             bool isSilence = true;
             for (char c : soundcardReadBuffer) {
                 if (c != (char) 0xFF) {
@@ -302,9 +463,11 @@ void alsaErrorLogger(const char *file, int line, const char *function, int err, 
                 }
             }
 
+            enum AudioRelayAction { shouldStart, shouldEnd, none };
+            AudioRelayAction actionToTake = none;
             if (voiceComHandle < 0 && !isSilence) {
-                PLOG_INFO << "Detected audio! Going to start relying audio to Hik device.";
-                voiceComHandle = startVoiceCommunications();
+                PLOG_INFO << "Detected audio! Going to start relaying audio to Hik device.";
+                actionToTake = shouldStart;
             } else if (voiceComHandle >= 0 && startOfSilence < 0 && isSilence) {
                 PLOG_INFO << "Detected start of silence. If no sound is heard for "
                     << MILLIS_OF_SILENCE_BEFORE_HANGUP << " millis we will hang up voice communications.";
@@ -318,9 +481,24 @@ void alsaErrorLogger(const char *file, int line, const char *function, int err, 
                 isSilence
             ) {
                 PLOG_INFO << "Observed " << MILLIS_OF_SILENCE_BEFORE_HANGUP << " millis of silence. Hanging up.";
-                stopVoiceCommunications(voiceComHandle);
-                voiceComHandle = -1;
+                actionToTake = shouldEnd;
                 startOfSilence = -1;
+            }
+
+            switch (actionToTake) {
+                case shouldStart:
+                    hikRelayEnabled = true;
+                    soundcardReadBufferCV.notify_one();
+                    voiceComHandle = startVoiceCommunications();
+                    break;
+                case shouldEnd:
+                    hikRelayEnabled = false;
+                    soundcardReadBufferCV.notify_one();
+                    stopVoiceCommunications(voiceComHandle);
+                    voiceComHandle = -1;
+                    break;
+                default:
+                    soundcardReadBufferCV.notify_one();
             }
         }
     }
@@ -367,12 +545,17 @@ int main(int argc, char** argv) {
                 cxxopts::value<std::string>()->default_value("")
         )
         (
-            "s,soundcard-coordinates",
+            "s,audio-capture-coordinates",
             "The ALSA name of the soundcard to read mu-law sound signal from",
+            cxxopts::value<std::string>()
+        )
+        (
+            "l,playback-soundcard-coordinates",
+            "The ALSA name of the soundcard to write mu-law sound signal to for the ringtone",
             cxxopts::value<std::string>()
         );
 
-    std::string deviceHost, deviceUsername, devicePassword, soundcardCoordinates;
+    std::string deviceHost, deviceUsername, devicePassword, audioCaptureCoordinates;
     unsigned short devicePort;
     try {
         auto result = options.parse(argc, argv);
@@ -380,9 +563,9 @@ int main(int argc, char** argv) {
         devicePort = result["device-port"].as<unsigned short>();
         deviceUsername = result["device-username"].as<std::string>();
         devicePassword = result["device-password"].as<std::string>();
-        soundcardCoordinates = result["soundcard-coordinates"].as<std::string>();
+        audioCaptureCoordinates = result["audio-capture-coordinates"].as<std::string>();
         ringtoneAudioFilePath = result["ringtone-audio"].as<std::string>();
-
+        ringtonePlaybackDeviceCoordinates = result["playback-soundcard-coordinates"].as<std::string>();
     } catch (const cxxopts::option_has_no_value_exception& e) {
         shutdown(std::make_optional(e.what()));
     }
@@ -413,7 +596,7 @@ int main(int argc, char** argv) {
         PLOG_INFO << "Successfully set Hik device audio settings.";
     }
 
-    std::thread soundcardReadThread(soundcardReadLoop, soundcardCoordinates);
+    std::thread soundcardReadThread(soundcardReadLoop, audioCaptureCoordinates);
 
     soundcardReadThread.join();
 
