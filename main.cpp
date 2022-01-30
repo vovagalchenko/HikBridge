@@ -28,10 +28,14 @@ typedef int HikSessionId, HikEventListeningHandle, HikVoiceComHandle;
 HikSessionId sessionId;
 char soundcardReadBuffer[160];
 std::mutex soundcardReadBufferMutex;
+std::mutex voiceComHandleMutex;
 std::condition_variable soundcardReadBufferCV;
 std::string doorbellHost;
 unsigned short doorbellPort;
 std::string doorbellPath;
+HikVoiceComHandle voiceComHandle = -1;
+long lastSoundcardLoopTime;
+bool intercomGotFuckedWith;
 
 void shutdown(std::stringstream &stream) {
     backward::StackTrace st;
@@ -138,73 +142,13 @@ void recoverPcm(snd_pcm_t *handle, int errCode) {
     }
 }
 
-void callDoorbell(int retryNum = 0) {
-    if (retryNum > 0) {
-        PLOG_WARNING << "Doorbell call retry number " << retryNum;
-    }
-    std::stringstream ss;
-    ss << "http://" << doorbellHost << ":" << doorbellPort;
-    httplib::Client doorbellHttpCall(ss.str());
-    doorbellHttpCall.set_url_encode(true);
-
-    PLOG_INFO << "Notifying doorbell service @ " << ss.str() << doorbellPath.c_str();
-    auto res = doorbellHttpCall.Get(doorbellPath.c_str());
-    PLOG_INFO << "Received result status: " << res->status;
-    if (res->status >= 300 && retryNum < 3) {
-        PLOG_WARNING << "The result is unexpected. Retrying...";
-        callDoorbell(retryNum + 1);
-    } else if (res->status >= 300) {
-        PLOG_ERROR << "Exhausted retries, but unable to make the doorbell HTTP callback :(";
-    } else {
-        PLOG_INFO << "Doorbell callback was successful";
-    }
-}
-
-void hikEventsCallback(
-    LONG lCommand,
-    [[maybe_unused]] NET_DVR_ALARMER *pAlarmer,
-    char *pAlarmInfo,
-    [[maybe_unused]] DWORD dwBufLen,
-    [[maybe_unused]] void* pUser
-) {
-    if (lCommand == COMM_ALARM_VIDEO_INTERCOM) {
-        auto *videoIntercomAlarm = reinterpret_cast<NET_DVR_VIDEO_INTERCOM_ALARM *>(pAlarmInfo);
-        PLOG_INFO << "Received Hik video intercom alarm: <" << (int) videoIntercomAlarm->byAlarmType << ">";
-        if (videoIntercomAlarm->byAlarmType == 0x11) {
-            PLOG_INFO << "Bell button was pressed";
-            callDoorbell();
-        }
-    } else {
-        PLOG_INFO << "Received Hik device event <" << lCommand << ">.";
-    }
-    PLOG_INFO << "Finished processing Hik device event";
-}
-
-HikEventListeningHandle registerForHikEvents() {
-    PLOG_INFO << "Registering for Hikvision events on session id <" << sessionId << ">";
-
-    NET_DVR_SetDVRMessageCallBack_V50(0, &hikEventsCallback, nullptr);
-
-    NET_DVR_SETUPALARM_PARAM setupParam;
-    setupParam.dwSize = sizeof(NET_DVR_SETUPALARM_PARAM);
-    setupParam.byAlarmInfoType = 1; // Real-time alarm
-    setupParam.byLevel = 2; // Priority
-
-    HikEventListeningHandle handle = NET_DVR_SetupAlarmChan_V41(sessionId, &setupParam);
-    if (handle < 0) {
-        shutdown(obtainHikSDKErrorMsg("Failed to register for events for Hik device."));
-    }
-    PLOG_INFO << "Successfully registered for receiving Hik device events with handle <" << handle << ">";
-    return handle;
-}
-
 bool hikRelayEnabled = false;
 void hikVoiceCommunicationsCallback(
-    HikVoiceComHandle lVoiceComHandle,
-    char *pRecvDataBuffer,
-    DWORD dwBufSize,
-    [[maybe_unused]] BYTE byAudioFlag,
-    [[maybe_unused]] void* pUser
+        HikVoiceComHandle lVoiceComHandle,
+        char *pRecvDataBuffer,
+        DWORD dwBufSize,
+        [[maybe_unused]] BYTE byAudioFlag,
+        [[maybe_unused]] void* pUser
 ) {
     assert(dwBufSize == sizeof(soundcardReadBuffer));
     if (!hikRelayEnabled) {
@@ -230,38 +174,113 @@ void hikVoiceCommunicationsCallback(
     }
 }
 
-HikVoiceComHandle startVoiceCommunications(unsigned short retryNum = 1) {
-    PLOG_INFO << "Starting voice communications on session id <" << sessionId << ">";
+void startVoiceCommunications(bool restart = false, unsigned short retryNum = 1) {
+    std::unique_lock<std::mutex> lk(voiceComHandleMutex);
+    if (restart && voiceComHandle < 0) {
+        PLOG_INFO << "No voice comms to restart. Abandoning...";
+        return;
+    } else if (restart) {
+        PLOG_INFO << "Restarting voice comms...";
+    } else {
+        PLOG_INFO << "Starting voice communications on session id <" << sessionId << ">";
+    }
 
-    HikVoiceComHandle voiceComHandle = NET_DVR_StartVoiceCom_MR_V30(
-        sessionId,
-        1,
-        hikVoiceCommunicationsCallback,
-        nullptr
+    HikVoiceComHandle voiceComHandleCandidate = NET_DVR_StartVoiceCom_MR_V30(
+            sessionId,
+            1,
+            hikVoiceCommunicationsCallback,
+            nullptr
     );
-    if (voiceComHandle < 0) {
+    if (voiceComHandleCandidate < 0) {
         PLOG_ERROR << obtainHikSDKErrorMsg("Failed to establish voice comms.");
         if (retryNum < 4) {
+            lk.unlock();
             PLOG_WARNING << "Retry num " << retryNum;
-            return startVoiceCommunications(retryNum + 1);
+            return startVoiceCommunications(restart, retryNum + 1);
         } else {
             shutdown(obtainHikSDKErrorMsg("Failed to establish voice comms."));
         }
     } else {
-        PLOG_INFO << "Successfully started voice communications with handle <" << voiceComHandle << ">";
+        PLOG_INFO << "Successfully started voice communications with handle <" << voiceComHandleCandidate << ">";
     }
-    return voiceComHandle;
+    voiceComHandle = voiceComHandleCandidate;
 }
 
+void callDoorbell(int retryNum = 0) {
+    if (retryNum > 0) {
+        PLOG_WARNING << "Doorbell call retry number " << retryNum;
+    }
+    std::stringstream ss;
+    ss << "http://" << doorbellHost << ":" << doorbellPort;
+    httplib::Client doorbellHttpCall(ss.str());
+    doorbellHttpCall.set_url_encode(true);
 
-void stopVoiceCommunications(HikVoiceComHandle voiceComHandle) {
+    PLOG_INFO << "Notifying doorbell service @ " << ss.str() << doorbellPath.c_str();
+    auto res = doorbellHttpCall.Get(doorbellPath.c_str());
+    PLOG_INFO << "Received result status: " << res->status;
+    if (res->status >= 300 && retryNum < 3) {
+        PLOG_WARNING << "The result is unexpected. Retrying...";
+        callDoorbell(retryNum + 1);
+    } else if (res->status >= 300) {
+        PLOG_ERROR << "Exhausted retries, but unable to make the doorbell HTTP callback :(";
+    } else {
+        PLOG_INFO << "Doorbell callback was successful";
+    }
+
+}
+
+void hikEventsCallback(
+    LONG lCommand,
+    [[maybe_unused]] NET_DVR_ALARMER *pAlarmer,
+    char *pAlarmInfo,
+    [[maybe_unused]] DWORD dwBufLen,
+    [[maybe_unused]] void* pUser
+) {
+    if (lCommand == COMM_ALARM_VIDEO_INTERCOM) {
+        auto *videoIntercomAlarm = reinterpret_cast<NET_DVR_VIDEO_INTERCOM_ALARM *>(pAlarmInfo);
+        PLOG_INFO << "Received Hik video intercom alarm: <" << (int) videoIntercomAlarm->byAlarmType << ">";
+        if (videoIntercomAlarm->byAlarmType == 0x11) {
+            PLOG_INFO << "Bell button was pressed";
+            callDoorbell();
+        } else if (videoIntercomAlarm->byAlarmType == 0x12) {
+            PLOG_INFO << "The intercom thinks it's being fucked with";
+            intercomGotFuckedWith = true;
+            soundcardReadBufferCV.notify_one();
+        }
+    } else {
+        PLOG_INFO << "Received Hik device event <" << lCommand << ">.";
+    }
+    PLOG_INFO << "Finished processing Hik device event";
+}
+
+HikEventListeningHandle registerForHikEvents() {
+    PLOG_INFO << "Registering for Hikvision events on session id <" << sessionId << ">";
+
+    NET_DVR_SetDVRMessageCallBack_V50(0, &hikEventsCallback, nullptr);
+
+    NET_DVR_SETUPALARM_PARAM setupParam;
+    setupParam.dwSize = sizeof(NET_DVR_SETUPALARM_PARAM);
+    setupParam.byAlarmInfoType = 1; // Real-time alarm
+    setupParam.byLevel = 2; // Priority
+
+    HikEventListeningHandle handle = NET_DVR_SetupAlarmChan_V41(sessionId, &setupParam);
+    if (handle < 0) {
+        shutdown(obtainHikSDKErrorMsg("Failed to register for events for Hik device."));
+    }
+    PLOG_INFO << "Successfully registered for receiving Hik device events with handle <" << handle << ">";
+    return handle;
+}
+
+void stopVoiceCommunications() {
     PLOG_INFO << "Wrapping up voice communications on session id <" << sessionId << ">";
 
+    std::unique_lock<std::mutex> lk(voiceComHandleMutex);
     if (!NET_DVR_StopVoiceCom(voiceComHandle)) {
         shutdown(obtainHikSDKErrorMsg("Failed to tear down voice comms."));
     } else {
         PLOG_INFO << "Successfully wrapped up voice communications on session id <" << sessionId << ">";
     }
+    voiceComHandle = -1;
 }
 
 void alsaErrorLogger(
@@ -282,6 +301,15 @@ void alsaErrorLogger(
     PLOG_ERROR << buff;
 }
 
+long currTimeInMillis() {
+    struct timeval tv {};
+    gettimeofday(&tv, nullptr);
+    return (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
+};
+
+long currTimeInSeconds() {
+    return currTimeInMillis() / 1000;
+};
 
 [[noreturn]] void soundcardReadLoop(const std::string &soundcardCoordinates) {
     PLOG_INFO << "Starting reading from soundcard @ " << soundcardCoordinates;
@@ -329,22 +357,15 @@ void alsaErrorLogger(
 
     unsigned int bitsPerSample = snd_pcm_format_width(format);
     unsigned short bitsPerByte = 8;
-    HikVoiceComHandle voiceComHandle = -1;
-    const auto currTimeInMillis = []() {
-        struct timeval tv {};
-        gettimeofday(&tv, nullptr);
-        return (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
-    };
-    const auto currTimeInSeconds = [currTimeInMillis]() {
-        return currTimeInMillis() / 1000;
-    };
+
+
     long startOfSilence = -1;
     unsigned long numFramesToRead = sizeof(soundcardReadBuffer) / (numChannels * (bitsPerSample / bitsPerByte));
 
     bool isBufferReady = false;
-    auto readFromPcm = [captureHandle, numFramesToRead, &voiceComHandle, &isBufferReady]() {
+    auto readFromPcm = [captureHandle, numFramesToRead, &isBufferReady]() {
         std::unique_lock<std::mutex> lk(soundcardReadBufferMutex);
-        if (isBufferReady && voiceComHandle >= 0) {
+        if (isBufferReady && voiceComHandle >= 0 && !intercomGotFuckedWith) {
             soundcardReadBufferCV.notify_one();
             soundcardReadBufferCV.wait(lk);
         }
@@ -353,16 +374,11 @@ void alsaErrorLogger(
     };
 
     PLOG_INFO << "Capturing sound from the soundcard";
-    unsigned long loggingCounter = 1;
-    unsigned short loggingIntervalInSeconds = 60;
-    unsigned long startTimeInSeconds = currTimeInSeconds();
     while (true) {
         long errCode;
         PLOG_DEBUG << "About to read " << numFramesToRead << " frames from the soundcard";
-        if (currTimeInSeconds() >= startTimeInSeconds + (loggingCounter * loggingIntervalInSeconds)) {
-            loggingCounter++;
-            PLOG_INFO << "Still capturing sound from the soundcard.";
-        }
+
+        lastSoundcardLoopTime = currTimeInMillis();
 
         if (
             (
@@ -388,6 +404,9 @@ void alsaErrorLogger(
             if (voiceComHandle < 0 && !isSilence) {
                 PLOG_INFO << "Detected audio! Going to start relaying audio to Hik device.";
                 actionToTake = shouldStart;
+            } else if (voiceComHandle >= 0 && intercomGotFuckedWith) {
+                PLOG_INFO << "It looks like intercom got fucked with, so we're going to need to restart voice comms.";
+                actionToTake = shouldStart;
             } else if (voiceComHandle >= 0 && startOfSilence < 0 && isSilence) {
                 PLOG_INFO << "Detected start of silence. If no sound is heard for "
                     << MILLIS_OF_SILENCE_BEFORE_HANGUP << " millis we will hang up voice communications.";
@@ -404,22 +423,41 @@ void alsaErrorLogger(
                 actionToTake = shouldEnd;
                 startOfSilence = -1;
             }
+            intercomGotFuckedWith = false;
 
             switch (actionToTake) {
                 case shouldStart:
                     hikRelayEnabled = true;
                     soundcardReadBufferCV.notify_one();
-                    voiceComHandle = startVoiceCommunications();
+                    startVoiceCommunications();
                     break;
                 case shouldEnd:
                     hikRelayEnabled = false;
                     soundcardReadBufferCV.notify_one();
-                    stopVoiceCommunications(voiceComHandle);
+                    stopVoiceCommunications();
                     voiceComHandle = -1;
                     break;
                 default:
                     soundcardReadBufferCV.notify_one();
             }
+        }
+    }
+}
+
+#define WATCHDOG_LOOP_INTERVAL_IN_SECONDS 10
+[[noreturn]] void watchdogLoop() {
+    PLOG_INFO << "Starting the watchdog loop thread";
+
+    while (true) {
+        sleep(WATCHDOG_LOOP_INTERVAL_IN_SECONDS);
+        long millisSinceLastSoundcardLoop = currTimeInMillis() - lastSoundcardLoopTime;
+        if (millisSinceLastSoundcardLoop > WATCHDOG_LOOP_INTERVAL_IN_SECONDS * 1000) {
+            std::stringstream ss;
+            ss << "The soundcard loop appears to be dead. The last loop took place "
+               << millisSinceLastSoundcardLoop << " ms ago";
+            shutdown(ss.str());
+        } else {
+            PLOG_INFO << "Still capturing sound from the soundcard.";
         }
     }
 
@@ -430,8 +468,8 @@ int main(int argc, char** argv) {
     static plog::ColorConsoleAppender<plog::TxtFormatter> consoleAppender;
     plog::init(
         plog::info,
-        "var/log/hikbridge/",
-        10u * (1u << 30u), // 10MB
+        "/var/log/hikbridge/runtime",
+        10u * (1u << 20u), // 10MB
         100
     ).addAppender(&consoleAppender);
 
@@ -528,6 +566,8 @@ int main(int argc, char** argv) {
     }
 
     std::thread soundcardReadThread(soundcardReadLoop, audioCaptureCoordinates);
+
+    std::thread watchdogThread(watchdogLoop);
 
     soundcardReadThread.join();
 

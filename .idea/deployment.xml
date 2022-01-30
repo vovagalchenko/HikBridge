@@ -2,10 +2,10 @@
 <project version="4">
   <component name="PublishConfigData">
     <serverData>
-      <paths name="Remote Host (834270f4-c777-4877-83eb-bf437181eb5f)">
+      <paths name="Remote Host (84c7b23e-886f-4396-a6e8-4aa73cdffbbf)">
         <serverdata>
           <mappings>
-            <mapping deploy="/tmp/HikBridge" local="$PROJECT_DIR$" />
+            <mapping deploy="/tmp/tmp.TnOSbBgpmh" local="$PROJECT_DIR$" />
           </mappings>
           <excludedPaths>
             <excludedPath local="true" path="$PROJECT_DIR$/cmake-build-debug" />

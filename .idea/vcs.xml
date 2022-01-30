@@ -4,6 +4,7 @@
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/AudioFile" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/backward-cpp" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cpp-httplib" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/cxxopts" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/plog" vcs="Git" />
   </component>

@@ -31,3 +31,8 @@ include_directories(hik-sdk-include)
 include_directories(cpp-httplib)
 include_directories(backward-cpp)
 include_directories(alsa-lib-1.2.6.1/include)
+
+install(TARGETS HikBridge DESTINATION bin/HikBridge)
+if (DEFINED REMOTE)
+    install(DIRECTORY hik-lib DESTINATION bin/HikBridge)
+endif()
