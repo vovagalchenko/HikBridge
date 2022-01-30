@@ -135,8 +135,9 @@ void recoverPcm(snd_pcm_t *handle, int errCode) {
     }
 }
 
+/*
+ * Uncomment to revive ringtone playback
 void ringtonePlaybackLoop() {
-
     snd_pcm_t *playbackHandle;
     if (
         auto sndOpenErrorMsg = checkAlsaError(
@@ -208,6 +209,28 @@ public:
     explicit Finally(void (*func)()): destructionFunc(func) {}
     ~Finally() { destructionFunc(); }
 };
+
+void kickOffRingtonePlayback() {
+    const std::lock_guard<std::mutex> guard(ringtonePlaybackMutex);
+    if (ringtonePlaying) {
+        PLOG_INFO << "Ringtone is already playing";
+    } else {
+        PLOG_INFO << "Kicking off ringtone playback";
+        ringtonePlaying = true;
+        std::thread ringtonePlaybackThread([] {
+            Finally f([] {
+                const std::lock_guard<std::mutex> g(ringtonePlaybackMutex);
+                ringtonePlaying = false;
+                PLOG_INFO << "Ringtone playback completed";
+            });
+            ringtonePlaybackLoop();
+        });
+        ringtonePlaybackThread.detach();
+    }
+}
+*/
+
+
 void hikEventsCallback(LONG lCommand, NET_DVR_ALARMER *pAlarmer, char *pAlarmInfo, DWORD dwBufLen, void* pUser) {
     if (lCommand == COMM_ALARM_VIDEO_INTERCOM) {
         auto *videoIntercomAlarm = reinterpret_cast<NET_DVR_VIDEO_INTERCOM_ALARM *>(pAlarmInfo);
@@ -216,22 +239,7 @@ void hikEventsCallback(LONG lCommand, NET_DVR_ALARMER *pAlarmer, char *pAlarmInf
             PLOG_INFO << "Bell button was pressed";
 
             {
-                const std::lock_guard<std::mutex> guard(ringtonePlaybackMutex);
-                if (ringtonePlaying) {
-                    PLOG_INFO << "Ringtone is already playing";
-                } else {
-                    PLOG_INFO << "Kicking off ringtone playback";
-                    ringtonePlaying = true;
-                    std::thread ringtonePlaybackThread([] {
-                        Finally f([] {
-                            const std::lock_guard<std::mutex> g(ringtonePlaybackMutex);
-                            ringtonePlaying = false;
-                            PLOG_INFO << "Ringtone playback completed";
-                        });
-                        ringtonePlaybackLoop();
-                    });
-                    ringtonePlaybackThread.detach();
-                }
+
             }
         }
     } else {
@@ -564,8 +572,6 @@ int main(int argc, char** argv) {
         deviceUsername = result["device-username"].as<std::string>();
         devicePassword = result["device-password"].as<std::string>();
         audioCaptureCoordinates = result["audio-capture-coordinates"].as<std::string>();
-        ringtoneAudioFilePath = result["ringtone-audio"].as<std::string>();
-        ringtonePlaybackDeviceCoordinates = result["playback-soundcard-coordinates"].as<std::string>();
     } catch (const cxxopts::option_has_no_value_exception& e) {
         shutdown(std::make_optional(e.what()));
     }

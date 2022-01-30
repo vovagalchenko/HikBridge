@@ -28,6 +28,7 @@ target_link_libraries(HikBridge PUBLIC hcnetsdk)
 include_directories(plog/include)
 include_directories(cxxopts/include)
 include_directories(hik-sdk-include)
+include_directories(cpp-httplib)
 include_directories(backward-cpp)
 include_directories(alsa-lib-1.2.6.1/include)
 
