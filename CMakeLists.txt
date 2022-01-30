@@ -31,5 +31,3 @@ include_directories(hik-sdk-include)
 include_directories(cpp-httplib)
 include_directories(backward-cpp)
 include_directories(alsa-lib-1.2.6.1/include)
-
-configure_file("BattleMulaw2.wav" "BattleMulaw2.wav" COPYONLY)

@@ -1,3 +1,5 @@
+#pragma clang diagnostic push
+#pragma ide diagnostic ignored "misc-no-recursion"
 #include <iostream>
 
 #include <plog/Log.h>
@@ -12,6 +14,7 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include "cpp-httplib/httplib.h"
 #ifdef REMOTE
     #include <alsa/asoundlib.h>
 #else
@@ -22,12 +25,13 @@
 #define MILLIS_OF_SILENCE_BEFORE_HANGUP 5000
 typedef int HikSessionId, HikEventListeningHandle, HikVoiceComHandle;
 
-std::string ringtoneAudioFilePath;
-std::string ringtonePlaybackDeviceCoordinates;
 HikSessionId sessionId;
 char soundcardReadBuffer[160];
 std::mutex soundcardReadBufferMutex;
 std::condition_variable soundcardReadBufferCV;
+std::string doorbellHost;
+unsigned short doorbellPort;
+std::string doorbellPath;
 
 void shutdown(std::stringstream &stream) {
     backward::StackTrace st;
@@ -130,117 +134,45 @@ void recoverPcm(snd_pcm_t *handle, int errCode) {
             PLOG_WARNING << "Recovered seemingly successfully.";
         }
     } else if (auto errMsg = checkAlsaError(errCode)){
-        // TODO: probably shouldn't kill the entire process in case of underrun during playback
         shutdown(*errMsg);
     }
 }
 
-/*
- * Uncomment to revive ringtone playback
-void ringtonePlaybackLoop() {
-    snd_pcm_t *playbackHandle;
-    if (
-        auto sndOpenErrorMsg = checkAlsaError(
-            snd_pcm_open(
-                &playbackHandle,
-                ringtonePlaybackDeviceCoordinates.c_str(),
-                SND_PCM_STREAM_PLAYBACK,
-                0
-            )
-        )
-        ) {
-        shutdown(*sndOpenErrorMsg);
+void callDoorbell(int retryNum = 0) {
+    if (retryNum > 0) {
+        PLOG_WARNING << "Doorbell call retry number " << retryNum;
+    }
+    std::stringstream ss;
+    ss << "http://" << doorbellHost << ":" << doorbellPort;
+    httplib::Client doorbellHttpCall(ss.str());
+    doorbellHttpCall.set_url_encode(true);
+
+    PLOG_INFO << "Notifying doorbell service @ " << ss.str() << doorbellPath.c_str();
+    auto res = doorbellHttpCall.Get(doorbellPath.c_str());
+    PLOG_INFO << "Received result status: " << res->status;
+    if (res->status >= 300 && retryNum < 3) {
+        PLOG_WARNING << "The result is unexpected. Retrying...";
+        callDoorbell(retryNum++);
+    } else if (res->status >= 300) {
+        PLOG_ERROR << "Exhausted retries, but unable to make the doorbell HTTP callback :(";
     } else {
-        PLOG_INFO << "Successfully opened an ALSA playback handle for " << ringtonePlaybackDeviceCoordinates;
-    }
-
-    // TODO: This is the same as in the soundcard capture loop
-    snd_pcm_format_t format = SND_PCM_FORMAT_MU_LAW;
-    unsigned short numChannels = 1;
-    unsigned int sampleRate = 8000;
-    int allowResampling = 1;
-    unsigned int requiredLatencyInUs = 500000;
-    if (
-        auto pcmSetParamsErrorMsg = checkAlsaError(
-            snd_pcm_set_params(
-                playbackHandle,
-                format,
-                SND_PCM_ACCESS_RW_INTERLEAVED,
-                numChannels,
-                sampleRate,
-                allowResampling,
-                requiredLatencyInUs
-            )
-        )
-        ) {
-        shutdown(*pcmSetParamsErrorMsg);
-    } else {
-        PLOG_INFO << "Successfully set PCM params for capture handle";
-    }
-
-    PLOG_INFO << "Opening ringtone file @ " << ringtoneAudioFilePath;
-    std::ifstream ringtoneFile(ringtoneAudioFilePath, std::ifstream::binary);
-    if (!ringtoneFile.good()) {
-        PLOG_ERROR << "Failed to open the ringtone file: " << strerror(errno);
-        return;
-    }
-
-#define BUFF_SIZE 160
-    char buff[BUFF_SIZE];
-    unsigned int bitsPerSample = snd_pcm_format_width(format);
-    unsigned short bitsPerByte = 8;
-    unsigned long numFramesToWrite = sizeof(soundcardReadBuffer) / (numChannels * (bitsPerSample / bitsPerByte));
-    long errCode;
-    while (ringtoneFile.readsome(buff, BUFF_SIZE)) {
-        if ((errCode = snd_pcm_writei(playbackHandle, buff, numFramesToWrite)) != numFramesToWrite) {
-            auto errMsg = checkAlsaError((int) errCode);
-            PLOG_WARNING << "Failed writing audio to soundcard: " << *errMsg;
-            recoverPcm(playbackHandle, (int) errCode);
-        }
+        PLOG_INFO << "Doorbell callback was successful";
     }
 }
 
-bool ringtonePlaying = false;
-std::mutex ringtonePlaybackMutex;
-struct Finally {
-private:
-    void (*destructionFunc)();
-public:
-    explicit Finally(void (*func)()): destructionFunc(func) {}
-    ~Finally() { destructionFunc(); }
-};
-
-void kickOffRingtonePlayback() {
-    const std::lock_guard<std::mutex> guard(ringtonePlaybackMutex);
-    if (ringtonePlaying) {
-        PLOG_INFO << "Ringtone is already playing";
-    } else {
-        PLOG_INFO << "Kicking off ringtone playback";
-        ringtonePlaying = true;
-        std::thread ringtonePlaybackThread([] {
-            Finally f([] {
-                const std::lock_guard<std::mutex> g(ringtonePlaybackMutex);
-                ringtonePlaying = false;
-                PLOG_INFO << "Ringtone playback completed";
-            });
-            ringtonePlaybackLoop();
-        });
-        ringtonePlaybackThread.detach();
-    }
-}
-*/
-
-
-void hikEventsCallback(LONG lCommand, NET_DVR_ALARMER *pAlarmer, char *pAlarmInfo, DWORD dwBufLen, void* pUser) {
+void hikEventsCallback(
+    LONG lCommand,
+    [[maybe_unused]] NET_DVR_ALARMER *pAlarmer,
+    char *pAlarmInfo,
+    [[maybe_unused]] DWORD dwBufLen,
+    [[maybe_unused]] void* pUser
+) {
     if (lCommand == COMM_ALARM_VIDEO_INTERCOM) {
         auto *videoIntercomAlarm = reinterpret_cast<NET_DVR_VIDEO_INTERCOM_ALARM *>(pAlarmInfo);
         PLOG_INFO << "Received Hik video intercom alarm: <" << (int) videoIntercomAlarm->byAlarmType << ">";
         if (videoIntercomAlarm->byAlarmType == 0x11) {
             PLOG_INFO << "Bell button was pressed";
-
-            {
-
-            }
+            callDoorbell();
         }
     } else {
         PLOG_INFO << "Received Hik device event <" << lCommand << ">.";
@@ -268,7 +200,11 @@ HikEventListeningHandle registerForHikEvents() {
 
 bool hikRelayEnabled = false;
 void hikVoiceCommunicationsCallback(
-    HikVoiceComHandle lVoiceComHandle, char *pRecvDataBuffer, DWORD dwBufSize, BYTE byAudioFlag, void* pUser
+    HikVoiceComHandle lVoiceComHandle,
+    char *pRecvDataBuffer,
+    DWORD dwBufSize,
+    [[maybe_unused]] BYTE byAudioFlag,
+    [[maybe_unused]] void* pUser
 ) {
     assert(dwBufSize == sizeof(soundcardReadBuffer));
     if (!hikRelayEnabled) {
@@ -305,7 +241,7 @@ HikVoiceComHandle startVoiceCommunications(unsigned short retryNum = 1) {
     );
     if (voiceComHandle < 0) {
         PLOG_ERROR << obtainHikSDKErrorMsg("Failed to establish voice comms.");
-        if (retryNum < 3) {
+        if (retryNum < 4) {
             PLOG_WARNING << "Retry num " << retryNum;
             return startVoiceCommunications(retryNum + 1);
         } else {
@@ -318,7 +254,6 @@ HikVoiceComHandle startVoiceCommunications(unsigned short retryNum = 1) {
 }
 
 
-
 void stopVoiceCommunications(HikVoiceComHandle voiceComHandle) {
     PLOG_INFO << "Wrapping up voice communications on session id <" << sessionId << ">";
 
@@ -329,7 +264,13 @@ void stopVoiceCommunications(HikVoiceComHandle voiceComHandle) {
     }
 }
 
-void alsaErrorLogger(const char *file, int line, const char *function, int err, const char *fmt, ...) {
+void alsaErrorLogger(
+    const char *file,
+    int line,
+    [[maybe_unused]] const char *function,
+    [[maybe_unused]] int err,
+    const char *fmt, ...
+) {
     va_list args;
     va_start (args, fmt);
     std::stringstream fmtStream;
@@ -430,36 +371,7 @@ void alsaErrorLogger(const char *file, int line, const char *function, int err, 
         ) {
             auto errMsg = checkAlsaError((int) errCode);
             PLOG_WARNING << "Failed reading audio from soundcard: " << *errMsg;
-            if (errCode == -EPIPE) {
-                PLOG_WARNING << "Experiencing overrun.";
-                snd_pcm_status_t *status;
-                snd_pcm_status_alloca(&status);
-                if (auto pcmStatusErrMsg = checkAlsaError(snd_pcm_status(captureHandle, status))) {
-                    std::stringstream ss;
-                    ss << "Failed to get PCM status after overrun: " << *pcmStatusErrMsg;
-                    shutdown(ss);
-                }
-                snd_pcm_status_get_state(status);
-                snd_output_t *statusOutput;
-                snd_output_buffer_open(&statusOutput);
-                snd_pcm_status_dump(status, statusOutput);
-                char *buff;
-                snd_output_buffer_string(statusOutput, &buff);
-                PLOG_WARNING << "PCM status: " << std::endl << buff;
-                snd_output_close(statusOutput);
-
-                if (auto recoverErrorMsg = checkAlsaError(
-                    snd_pcm_recover(captureHandle, (int) errCode, 0)
-                )) {
-                    std::stringstream ss;
-                    ss << "Failed to recover after overrun: " << *recoverErrorMsg;
-                    shutdown(ss);
-                } else {
-                    PLOG_WARNING << "Recovered seemingly successfully.";
-                }
-            } else {
-                shutdown(errMsg);
-            }
+            recoverPcm(captureHandle, (int) errCode);
         } else {
             isBufferReady = true;
             soundcardReadBufferCV.notify_one();
@@ -558,8 +470,18 @@ int main(int argc, char** argv) {
             cxxopts::value<std::string>()
         )
         (
-            "l,playback-soundcard-coordinates",
-            "The ALSA name of the soundcard to write mu-law sound signal to for the ringtone",
+            "d,doorbell-host",
+            "The host to make an HTTP GET request to when the doorbell is rung",
+            cxxopts::value<std::string>()
+        )
+        (
+            "o,doorbell-port",
+            "The port to make an HTTP GET request to when the doorbell is rung",
+            cxxopts::value<unsigned short>()
+        )
+        (
+            "a,doorbell-path",
+            "The path to make an HTTP GET request to when the doorbell is rung",
             cxxopts::value<std::string>()
         );
 
@@ -572,6 +494,9 @@ int main(int argc, char** argv) {
         deviceUsername = result["device-username"].as<std::string>();
         devicePassword = result["device-password"].as<std::string>();
         audioCaptureCoordinates = result["audio-capture-coordinates"].as<std::string>();
+        doorbellHost = result["doorbell-host"].as<std::string>();
+        doorbellPort = result["doorbell-port"].as<unsigned short>();
+        doorbellPath = result["doorbell-path"].as<std::string>();
     } catch (const cxxopts::option_has_no_value_exception& e) {
         shutdown(std::make_optional(e.what()));
     }
@@ -583,7 +508,7 @@ int main(int argc, char** argv) {
         devicePassword
     );
 
-    HikEventListeningHandle eventLHandle = registerForHikEvents();
+    registerForHikEvents();
 
     NET_DVR_COMPRESSION_AUDIO audioSettings = { 0 };
     audioSettings.byAudioEncType = 1;
@@ -610,7 +535,4 @@ int main(int argc, char** argv) {
 }
 
 
-
-
-
-
+#pragma clang diagnostic pop
