@@ -152,7 +152,7 @@ void callDoorbell(int retryNum = 0) {
     PLOG_INFO << "Received result status: " << res->status;
     if (res->status >= 300 && retryNum < 3) {
         PLOG_WARNING << "The result is unexpected. Retrying...";
-        callDoorbell(retryNum++);
+        callDoorbell(retryNum + 1);
     } else if (res->status >= 300) {
         PLOG_ERROR << "Exhausted retries, but unable to make the doorbell HTTP callback :(";
     } else {
